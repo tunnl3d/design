@@ -666,6 +666,66 @@ messages/{tenant_id}/_config.json
 }
 ```
 
+
+## 13.4 History API Security
+
+### Access Control
+
+The history API requires HMAC-signed access tokens to prevent unauthorized access.
+This protects against:
+
+- **Tenant/room enumeration** - Attackers cannot probe for valid IDs
+- **Metadata leakage** - Only authenticated room members can see message metadata
+- **Traffic analysis** - Timing and frequency patterns are protected
+
+### Token Format
+
+```
+token = base64(HMAC-SHA256(tenant:room:pseudonymId:expiry, access_key))
+```
+
+### Client-Side Token Generation
+
+Clients derive access tokens using MLS exporter (zero-trust, no server secrets):
+
+```typescript
+// Derive access key from MLS group state
+const accessKey = await mlsGroup.export("tunnl3d-history-access", roomId, 32);
+
+// Build message to sign
+const expiry = Date.now() + 3600000; // 1 hour
+const message = `${tenantId}:${roomId}:${pseudonymId}:${expiry}`;
+
+// Compute HMAC and encode
+const token = base64(hmacSha256(accessKey, message));
+```
+
+### Request Format
+
+```
+GET /api/v1/history
+  ?tenant=xxx
+  &room=yyy
+  &since=2024-12-23T00:00:00.000Z
+  &pseudonym=user-789
+  &expiry=1735000000000
+  &token=base64-hmac-signature
+
+# Or via Authorization header:
+Authorization: Bearer base64-hmac-signature
+```
+
+### Security Properties
+
+| Property | Guarantee |
+|----------|-----------|
+| **Authentication** | Only room members with MLS state can generate valid tokens |
+| **Authorization** | Token is scoped to specific tenant/room |
+| **Expiry** | Tokens are time-limited (recommended: 1 hour) |
+| **Non-replayable** | Expired tokens rejected |
+| **Zero-trust** | Server validates, but client holds key derivation secrets |
+| **Timing-safe** | Constant-time comparison prevents timing attacks |
+
 ---
 
 # 14. Summary
