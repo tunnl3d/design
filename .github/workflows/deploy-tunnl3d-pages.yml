@@ -2,7 +2,7 @@
 
 on:
   push:
-    branches: [main]
+    branches: [release]
     paths:
       - 'public/tunnl3d.com/**'
   workflow_dispatch: # Allows manual trigger from GitHub UI
