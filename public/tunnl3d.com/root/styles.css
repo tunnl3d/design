@@ -140,3 +140,21 @@ footer p {
         font-size: 0.8rem;
     }
 }
+
+.icon-badge {
+    position: fixed;
+    top: 1.5rem;
+    right: 1.5rem;
+    z-index: 10;
+    opacity: 0.8;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.icon-badge:hover {
+    opacity: 1;
+    transform: scale(1.1);
+}
+
+.icon-badge img {
+    display: block;
+}
