@@ -302,32 +302,34 @@ async function queryHistory(tenant, room, since, sequence, limit) {
 
 When a client reconnects after being offline:
 
-```
-Client                      Cloudflare                    DO          R2
-   │                            │                          │           │
-   │  1. Request history        │                          │           │
-   │──GET /api/v1/history──────▶│                          │           │
-   │                            │                          │           │
-   │                            │  2. Query R2             │           │
-   │                            │─────────────────────────────────────▶│
-   │                            │◀────────────────────────────────────│
-   │                            │                          │           │
-   │                            │  3. Query DO buffer      │           │
-   │                            │  (if recent time range)  │           │
-   │                            │─────────────────────────▶│           │
-   │                            │◀─────────────────────────│           │
-   │                            │                          │           │
-   │  4. Return merged messages │                          │           │
-   │◀──{"messages":[...]}───────│                          │           │
-   │                            │                          │           │
-   │  5. Process messages (MLS decrypt)                    │           │
-   │                            │                          │           │
-   │  6. Reconnect WebSocket    │                          │           │
-   │──GET /ws/:tenant/:room────▶│                          │           │
-   │◀──101 Switching Protocols──│                          │           │
-   │                            │                          │           │
-   │  7. Resume real-time       │                          │           │
-   │◀══WebSocket messages═══════│                          │           │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant HW as History Worker
+    participant DO as Room DO
+    participant R2 as R2 Bucket
+
+    Note over C: Client comes online<br/>after being offline
+
+    C->>HW: GET /api/v1/history
+    
+    par Query both sources
+        HW->>R2: Query persisted messages
+        R2-->>HW: Return matching messages
+        HW->>DO: Query recent buffer<br/>(if recent time range)
+        DO-->>HW: Return buffered messages
+    end
+    
+    HW->>HW: Merge & deduplicate
+    HW->>C: Return unified history
+
+    Note over C: Process messages<br/>(MLS decrypt)
+
+    C->>DO: GET /ws/:tenant/:room
+    DO->>C: 101 Switching Protocols
+
+    Note over C,DO: Resume real-time<br/>WebSocket messages
 ```
 
 ### Client State Tracking

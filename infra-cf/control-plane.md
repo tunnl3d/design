@@ -28,13 +28,19 @@ The DO never sees plaintext or MLS secrets.
 
 ## Proposal Lifecycle
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   pending   │────▶│  approved   │────▶│  committed  │     │   expired   │
-└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
-      │                                                            ▲
-      │                                                            │
-      └────────────────────(24h timeout)───────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> pending: Proposal created
+    
+    pending --> approved: Client detects quorum
+    pending --> rejected: Client publishes rejection
+    pending --> expired: 24h timeout (DO alarm)
+    
+    approved --> committed: Client publishes MLS commit
+    
+    committed --> [*]
+    rejected --> [*]
+    expired --> [*]
 ```
 
 Proposals are stored in DO storage with:
