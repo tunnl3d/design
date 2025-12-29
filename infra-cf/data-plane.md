@@ -1,28 +1,89 @@
 ﻿# Data Plane: Workers + Queues
 
-The data plane handles all ciphertext transport with a focus on low-latency delivery.
+The data plane handles all ciphertext transport with a focus on low-latency delivery and **instant message availability**.
 
 ---
 
 ## Application Messages
 
-Message flow prioritizes delivery speed:
+Message flow ensures **immediate inbox availability**:
 
 1. Client encrypts message using MLS application keys
 2. Worker receives ciphertext over WebSocket or HTTP
-3. Worker enqueues to `MLS_QUEUE` for ordered delivery
-4. Queue consumer delivers to Room DO
-5. Room DO broadcasts to WebSocket clients (synchronous, non-blocking)
-6. Room DO buffers message in rolling history buffer
-7. Room DO enqueues to `HISTORY_QUEUE` (fire-and-forget)
-8. History queue consumer writes to R2 in batches
+3. Worker **synchronously** delivers to Room DO
+4. Room DO checks per-room rate limit
+5. Room DO buffers message in rolling inbox buffer (immediate)
+6. Room DO broadcasts to connected WebSocket clients (synchronous)
+7. Room DO enqueues to `INBOX_QUEUE` (fire-and-forget for R2 persistence)
+8. Success response returned to client
 
 Properties:
 
-- **Delivery-first architecture** — clients receive messages before R2 persistence
+- **Immediate availability** — messages are in the inbox buffer before HTTP response
+- **Synchronous buffering** — no async gaps between submit and availability
+- **Synchronous WebSocket broadcast** — connected clients receive message immediately
+- **Per-room rate limiting** — prevents buffer overflow under heavy load
 - **No plaintext** — server sees only ciphertext
 - **No handle or identity leakage** — only pseudonym IDs in routing
-- **High-throughput, low-latency global delivery**
+- **No inter-DO communication** — each room has exactly one DO instance
+
+---
+
+## Rate Limiting
+
+Each room has its own rate limiter to prevent buffer overflow and ensure fair resource allocation.
+
+### Rate Limit Configuration
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Window | 5 seconds | Matches INBOX_QUEUE processing delay |
+| Max messages | 500 | Matches DO buffer size |
+| Sustained rate | 100 msg/sec | 500 messages ÷ 5 seconds |
+
+### Overflow Guarantee
+
+The rate limit is specifically designed to **guarantee no buffer overflow**:
+
+```
+Rate limit (500 msg / 5s) = Buffer size (500 messages)
+```
+
+Since R2 persistence has ~5 second latency via the queue, limiting to 500 messages per 5 seconds ensures that messages cannot arrive faster than they can be persisted. This provides a mathematically guaranteed protection against data loss.
+
+### Rate Limit Responses
+
+**HTTP POST /api/v1/message:**
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 2
+Content-Type: application/json
+
+{
+  "error": "Rate limit exceeded",
+  "retryAfterMs": 1847
+}
+```
+
+**WebSocket:**
+```json
+{
+  "action": "error",
+  "error": "Rate limit exceeded",
+  "errorCode": "RATE_LIMIT_EXCEEDED"
+}
+```
+
+### Sliding Window Algorithm
+
+The rate limiter uses a sliding window algorithm:
+
+1. Each message delivery records a timestamp
+2. Timestamps older than the window (5s) are pruned
+3. If count >= limit (500), request is rejected
+4. Response includes precise `retryAfterMs` for efficient client backoff
+
+The algorithm is implemented in-memory for performance, with async persistence to DO storage for durability across hibernation.
 
 ---
 
@@ -33,71 +94,99 @@ sequenceDiagram
     autonumber
     participant C as Client (Sender)
     participant W as Worker (Ingress)
-    participant MQ as MLS_QUEUE
     participant DO as Room DO
-    participant HQ as HISTORY_QUEUE
+    participant IQ as INBOX_QUEUE
     participant R2 as R2 Bucket
     participant M as Member Clients
 
     Note over C: MLS encrypts message<br/>→ ciphertext only
 
-    C->>W: WebSocket send(ciphertext)
+    C->>W: HTTP POST /api/v1/message
     W->>W: Validate envelope structure
-    W->>MQ: Enqueue message
-
-    MQ->>DO: Deliver in order
-
-    DO->>M: WebSocket broadcast (sync)
-    DO->>DO: Buffer in rolling history
-    DO-->>HQ: Enqueue for R2 (fire-and-forget)
-
-    Note over M: Clients receive message<br/>immediately
-
-    HQ->>R2: Batched write
+    W->>DO: Synchronous /deliver call
     
-    Note over R2: Message persisted<br/>for reconnection
+    DO->>DO: Check rate limit
+    alt Rate limited
+        DO-->>W: 429 Too Many Requests
+        W->>C: 429 + Retry-After
+    else Allowed
+        DO->>DO: Buffer in rolling inbox (IMMEDIATE)
+        DO->>M: WebSocket broadcast (connected clients)
+        DO-->>IQ: Enqueue for R2 (fire-and-forget)
+        DO-->>W: Return success + seq
+        W->>C: 200 OK with messageId
+    end
+
+    Note over C: Message is NOW available<br/>in inbox API
+
+    IQ->>R2: Batched write (~5s delay)
 ```
 
-The critical insight is that **R2 writes happen asynchronously** after message delivery. This ensures:
+The critical insight is that **everything happens synchronously** before returning success to the client:
 
-- Clients receive messages with minimal latency
-- R2 write failures don't impact delivery
-- Batched writes reduce R2 API costs
+- Rate limit check (fast, in-memory)
+- Message is buffered in DO (immediate inbox availability)
+- WebSocket broadcast to all connected clients in this room
+- R2 persistence is the only async operation (fire-and-forget)
+
+There is **no inter-DO communication**. Each room has exactly one Durable Object instance that handles all clients for that room.
 
 ---
 
 ## Queue Architecture
 
-tunnl3d uses three Cloudflare Queues to separate concerns and optimize for latency:
+tunnl3d uses Cloudflare Queues for async R2 persistence:
 
 | Queue | Purpose | Batch Size | Timeout | Retries |
 |-------|---------|------------|---------|---------|
-| `MLS_QUEUE` | Real-time message delivery to Room DOs | 100 | 1s | 3 |
-| `HISTORY_QUEUE` | Async R2 persistence (off hot path) | 100 | 5s | 5 |
+| `INBOX_QUEUE` | Async R2 persistence (off hot path) | 100 | 5s | 5 |
 | `MLS_DLQ` | Dead letter queue for failed messages | — | — | — |
 
-This separation ensures that R2 write latency never impacts message delivery latency.
+All message delivery happens **synchronously** via the Room DO. The queue is only used for durable R2 persistence after messages are already delivered to clients.
 
 ---
 
-## Message History & Client Reconnection
+## Inbox Storage & Immediate Availability
 
-tunnl3d provides durable message history for client reconnection with a two-tier architecture:
+tunnl3d guarantees **instant message availability** with a two-tier architecture:
 
-1. **DO Buffer** — Rolling buffer of last 50 messages for instant access
-2. **R2 Storage** — Durable persistence for full history replay
+1. **DO Buffer** — Rolling buffer of last 500 messages, populated **synchronously**
+2. **R2 Inbox** — Durable persistence for full message history
 
-This design ensures clients can immediately access recent messages even before R2 persistence completes.
+### Immediate Availability Guarantee
 
-### History Architecture
+```mermaid
+sequenceDiagram
+    participant C1 as Client (Sender)
+    participant C2 as Client (Fetcher)
+    participant W as Worker
+    participant DO as Room DO
+    
+    C1->>W: POST /api/v1/message
+    W->>DO: /deliver (sync)
+    DO->>DO: Buffer message (seq=N)
+    DO-->>W: Success
+    W->>C1: 200 OK {messageId, seq}
+    
+    Note over C1,C2: IMMEDIATE - No delay
+    
+    C2->>W: GET /v1/inbox/messages<br/>X-Inbox-ID: {inboxId}
+    W->>DO: Query buffer
+    DO-->>W: Return message (seq=N)
+    W->>C2: 200 OK with message
+```
+
+The message is **guaranteed** to be available in inbox API responses as soon as the sender receives their 200 OK.
+
+### Inbox Architecture
 
 ```mermaid
 flowchart TD
-    subgraph Request["History Request"]
+    subgraph Request["Inbox Request"]
         C[Client]
     end
     
-    subgraph HW["History Worker"]
+    subgraph IW["Inbox Worker"]
         Q1[Query R2 for<br/>persisted msgs]
         Q2[Query DO buffer<br/>for recent msgs]
         M[Merge & Deduplicate]
@@ -108,7 +197,7 @@ flowchart TD
         DO[(Room DO Buffer)]
     end
     
-    C --> HW
+    C --> IW
     Q1 --> R2
     Q2 --> DO
     Q1 --> M
@@ -116,24 +205,24 @@ flowchart TD
     M --> C
 ```
 
-The History Worker intelligently combines data from both sources:
+The Inbox Worker intelligently combines data from both sources:
 
 - Always queries R2 for persisted messages
-- Queries DO buffer when the time range is recent (within 30 seconds)
-- Deduplicates by message ID (R2 messages are authoritative)
+- Always queries DO buffer for recent messages
+- Deduplicates by message ID (R2 messages are authoritative for seq)
 - Returns sorted, unified results
 
 ### DO Rolling Buffer
 
-The Room DO maintains a rolling buffer of the 50 most recent messages:
+The Room DO maintains a rolling buffer of the 500 most recent messages:
 
 ```typescript
-interface BufferedHistoryEntry {
-  id: string;           // Message ID
-  sequence: number;     // Client-assigned sequence
-  timestamp: string;    // ISO 8601 timestamp
-  envelope: AnyEnvelope;
-  bufferedAt: string;   // When buffered in DO
+interface BufferedInboxEntry {
+  seq: number;            // Sequence number
+  messageId: string;      // Message ID
+  ciphertext: string;     // MLS-encrypted payload
+  envelope: AnyEnvelope;  // Full envelope for internal use
+  bufferedAt: string;     // When buffered in DO
 }
 ```
 
@@ -141,107 +230,70 @@ Buffer properties:
 
 | Property | Value |
 |----------|-------|
-| Size | 50 messages |
+| Size | 500 messages |
 | Eviction | FIFO (oldest removed when full) |
-| Latency | Immediate (DO storage) |
-| Durability | Transient (for recent messages only) |
+| Latency | Immediate (synchronous write) |
+| Durability | Transient (backed by R2 for durability) |
+| Population | **Synchronous** during /deliver |
 
-The buffer is populated synchronously during message delivery, ensuring messages are available for history queries immediately.
+The buffer is populated **synchronously** during the HTTP request, before returning success. This is the key to instant availability.
+
+### Idempotency
+
+The `/deliver` endpoint is idempotent:
+
+- If a message with the same `messageId` already exists in the buffer, it returns the existing `seq`
+- This prevents duplicate messages from concurrent requests
+- Clients can safely retry failed requests
 
 ### R2 Persistent Storage
 
-Messages are durably persisted to R2 via the `HISTORY_QUEUE`:
+Messages are durably persisted to R2 via the `INBOX_QUEUE`:
 
 #### R2 Key Structure
 
 ```
-messages/{tenant_id}/{room_id}/{YYYY-MM-DD}/{timestamp}-{message_id}.json
+inbox/{inboxId}/{seq:010d}-{messageId}.json
 ```
 
 Example:
 ```
-messages/tenant-123/room-456/2024-12-23/1703337600000-msg-abc123.json
-```
-
-#### Message Object Format
-
-```json
-{
-  "id": "msg-abc123",
-  "sequence": 42,
-  "timestamp": "2024-12-23T12:00:00.000Z",
-  "envelope": {
-    "type": "mls_app",
-    "tenantId": "tenant-123",
-    "roomId": "room-456",
-    "pseudonymId": "user-789",
-    "sequence": 42,
-    "timestamp": "2024-12-23T12:00:00.000Z",
-    "ciphertext": "base64-encoded-encrypted-content"
-  },
-  "storedAt": "2024-12-23T12:00:01.000Z"
-}
+inbox/tenant-123:room-456/0000000042-msg-abc123.json
 ```
 
 #### Storage Properties
 
 | Property | Value |
 |----------|-------|
-| Cost | $0.015/GB/month |
-| Max object size | 5 TB |
+| Write timing | Async (via INBOX_QUEUE, ~5s delay) |
+| Durability | High (R2 replication) |
 | Default retention | 7 days |
 | Auto-expiration | Lifecycle policy |
-| Write pattern | Batched (via HISTORY_QUEUE) |
-
-#### Batched Write Flow
-
-```mermaid
-sequenceDiagram
-    participant DO as Room DO
-    participant HQ as HISTORY_QUEUE
-    participant HC as History Consumer
-    participant R2 as R2 Bucket
-
-    DO-->>HQ: Enqueue message (fire-and-forget)
-    
-    Note over HQ: Batches accumulate<br/>(up to 100 msgs, 5s timeout)
-    
-    HQ->>HC: Deliver batch
-    
-    par Parallel writes
-        HC->>R2: PUT message 1
-        HC->>R2: PUT message 2
-        HC->>R2: PUT message N
-    end
-    
-    HC->>HQ: ACK batch
-```
-
-Benefits of batched writes:
-
-- Reduced R2 API calls
-- Lower cost
-- Better throughput
-- Failures don't block delivery
 
 ---
 
-## History API
+## Inbox API
 
-The History Worker serves the `/api/v1/history` endpoint:
+The Inbox Worker serves the inbox endpoints for message retrieval. The `inboxId` is passed via the `X-Inbox-ID` header to keep the capability token out of HTTP access logs.
 
-**Endpoint:** `GET /api/v1/history`
+📄 **Full specification:** [inbox-api.md](inbox-api.md)
+
+### Fetch Messages
+
+**Endpoint:** `GET /v1/inbox/messages`
+
+**Headers:**
+
+| Header | Type | Required | Description |
+|--------|------|----------|-------------|
+| `X-Inbox-ID` | string | Yes | Opaque room inbox identifier |
 
 **Query Parameters:**
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `tenant` | string | Yes | Tenant ID |
-| `room` | string | Yes | Room ID |
-| `since` | ISO 8601 | Yes | Start timestamp (inclusive) |
-| `sequence` | number | No | Last known sequence (filters results) |
-| `limit` | number | No | Max messages (default: 100, max: 1000) |
-| `cursor` | string | No | Pagination cursor for next page |
+| `fromSeq` | integer | No | Start from this sequence number (default: 0) |
+| `limit` | integer | No | Max messages (default: 100, max: 1000) |
 
 **Response:**
 
@@ -249,50 +301,43 @@ The History Worker serves the `/api/v1/history` endpoint:
 {
   "messages": [
     {
-      "id": "msg-abc123",
-      "sequence": 43,
-      "timestamp": "2024-12-23T10:05:00.000Z",
-      "envelope": { ... },
-      "storedAt": "2024-12-23T10:05:01.000Z"
+      "seq": 42,
+      "messageId": "msg-abc123",
+      "ciphertext": "base64url-encoded-content",
+      "createdAt": "2024-12-23T10:05:00.000Z"
     }
   ],
-  "hasMore": true,
-  "nextCursor": "2024-12-23T10:06:00.000Z:msg-def456"
+  "nextSeq": 43
 }
 ```
 
-**Error Responses:**
+### Append Message
 
-| Status | Description |
-|--------|-------------|
-| 400 | Missing required parameters |
-| 401 | Missing or expired access token |
-| 403 | Invalid access token |
-| 429 | Rate limited |
-| 500 | Internal error |
+**Endpoint:** `POST /v1/inbox/append`
 
-### Query Logic
+**Headers:**
 
-```typescript
-// Pseudocode for history query
-async function queryHistory(tenant, room, since, sequence, limit) {
-  // 1. Always query R2
-  const r2Messages = await readFromR2(tenant, room, since, sequence, limit);
-  
-  // 2. Check if we need DO buffer
-  const now = Date.now();
-  const sinceTimestamp = new Date(since).getTime();
-  const recentThreshold = now - 30_000; // 30 seconds
-  
-  if (sinceTimestamp >= recentThreshold || r2Messages.length === 0) {
-    // Query DO buffer for recent messages
-    const bufferMessages = await queryDoBuffer(tenant, room, since, sequence);
-    
-    // Merge and deduplicate
-    return mergeAndDeduplicate(r2Messages, bufferMessages);
-  }
-  
-  return r2Messages;
+| Header | Type | Required | Description |
+|--------|------|----------|-------------|
+| `X-Inbox-ID` | string | Yes | Opaque room inbox identifier |
+
+Used for direct inbox writes (bypassing the Room DO flow).
+
+**Request Body:**
+
+```json
+{
+  "messageId": "msg-abc123",
+  "ciphertext": "base64url-encoded-content"
+}
+```
+
+**Response:**
+
+```json
+{
+  "seq": 42,
+  "storedAt": "2024-12-23T10:05:00.000Z"
 }
 ```
 
@@ -306,23 +351,24 @@ When a client reconnects after being offline:
 sequenceDiagram
     autonumber
     participant C as Client
-    participant HW as History Worker
+    participant IW as Inbox Worker
     participant DO as Room DO
     participant R2 as R2 Bucket
 
     Note over C: Client comes online<br/>after being offline
 
-    C->>HW: GET /api/v1/history
+    C->>C: Derive inboxId from MLS state
+    C->>IW: GET /v1/inbox/messages<br/>X-Inbox-ID: {inboxId}
     
     par Query both sources
-        HW->>R2: Query persisted messages
-        R2-->>HW: Return matching messages
-        HW->>DO: Query recent buffer<br/>(if recent time range)
-        DO-->>HW: Return buffered messages
+        IW->>R2: Query persisted messages
+        R2-->>IW: Return matching messages
+        IW->>DO: Query recent buffer
+        DO-->>IW: Return buffered messages
     end
     
-    HW->>HW: Merge & deduplicate
-    HW->>C: Return unified history
+    IW->>IW: Merge & deduplicate
+    IW->>C: Return unified inbox
 
     Note over C: Process messages<br/>(MLS decrypt)
 
@@ -332,93 +378,38 @@ sequenceDiagram
     Note over C,DO: Resume real-time<br/>WebSocket messages
 ```
 
-### Client State Tracking
-
-Clients persist locally:
-
-```typescript
-interface ClientRoomState {
-  tenantId: string;
-  roomId: string;
-  lastSequence: number;        // Last received sequence number
-  lastTimestamp: string;       // ISO 8601 timestamp of last message
-  lastMessageId: string;       // ID of last received message
-}
-```
-
 ### Edge Cases
 
 | Scenario | Handling |
 |----------|----------|
-| **Duplicate messages** | Client filters by sequence number; server deduplicates by ID |
-| **Out-of-order messages** | Server sorts by sequence before returning |
-| **Large gap** | Paginate with cursor, process in batches |
-| **MLS epoch change** | Client may need to re-fetch group state |
-| **Network failure during replay** | Retry from last processed sequence |
-| **R2 unavailable** | DO buffer provides recent messages; return 503 for older |
-| **Message in buffer but not R2** | Merge logic includes buffer messages not yet in R2 |
+| **Duplicate messages** | Deduplicated by messageId |
+| **Out-of-order messages** | Server sorts by seq |
+| **Message in buffer but not R2** | Merge includes buffer messages |
+| **R2 unavailable** | DO buffer provides recent messages |
+| **Concurrent senders** | DO buffer is atomic, seq is monotonic |
 
 ---
 
-## History API Security
+## Inbox Security
 
 ### Access Control
 
-The history API requires HMAC-signed access tokens to prevent unauthorized access.
-
-**Protections:**
-
-- **Tenant/room enumeration** — Attackers cannot probe for valid IDs
-- **Metadata leakage** — Only authenticated room members can see message metadata
-- **Traffic analysis** — Timing and frequency patterns are protected
-
-### Token Format
-
-```
-token = base64(HMAC-SHA256(tenant:room:pseudonymId:expiry, access_key))
-```
-
-### Client-Side Token Generation
-
-Clients derive access tokens using MLS exporter (zero-trust, no server secrets):
+The `inboxId` is a capability token derived from MLS group state:
 
 ```typescript
-// Derive access key from MLS group state
-const accessKey = await mlsGroup.export("tunnl3d-history-access", roomId, 32);
-
-// Build message to sign
-const expiry = Date.now() + 3600000; // 1 hour
-const message = `${tenantId}:${roomId}:${pseudonymId}:${expiry}`;
-
-// Compute HMAC and encode
-const token = base64(hmacSha256(accessKey, message));
+// Client-side derivation (all members compute identical inboxId)
+const inboxKey = await mlsGroup.export("tunnl3d-inbox-key", roomId, 32);
+const inboxId = base64(hmacSha256(inboxKey, "inbox-id"));
 ```
 
-### Request Format
-
-```
-GET /api/v1/history
-  ?tenant=xxx
-  &room=yyy
-  &since=2024-12-23T00:00:00.000Z
-  &pseudonym=user-789
-  &expiry=1735000000000
-  &token=base64-hmac-signature
-
-# Or via Authorization header:
-Authorization: Bearer base64-hmac-signature
-```
-
-### Security Properties
+**Security Properties:**
 
 | Property | Guarantee |
 |----------|-----------|
-| **Authentication** | Only room members with MLS state can generate valid tokens |
-| **Authorization** | Token is scoped to specific tenant/room |
-| **Expiry** | Tokens are time-limited (recommended: 1 hour) |
-| **Non-replayable** | Expired tokens rejected |
-| **Zero-trust** | Server validates, but client holds key derivation secrets |
-| **Timing-safe** | Constant-time comparison prevents timing attacks |
+| **Authentication** | Only room members can derive the inboxId |
+| **Authorization** | Knowledge of inboxId grants access |
+| **Opacity** | Relay cannot correlate inboxId to room or tenant |
+| **Zero-trust** | Relay stores only ciphertext |
 
 ---
 
@@ -431,16 +422,14 @@ Authorization: Bearer base64-hmac-signature
 
 ### R2 Lifecycle Configuration
 
-Lifecycle rules must be configured via Cloudflare Dashboard or API (not supported in wrangler.toml):
-
 ```json
 {
   "rules": [
     {
-      "id": "expire-old-messages",
+      "id": "expire-old-inbox-messages",
       "enabled": true,
       "conditions": {
-        "prefix": "messages/"
+        "prefix": "inbox/"
       },
       "actions": {
         "expiration": {
@@ -450,21 +439,3 @@ Lifecycle rules must be configured via Cloudflare Dashboard or API (not supporte
     }
   ]
 }
-```
-
-To apply via API:
-
-```bash
-curl -X PUT "https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket_name}/lifecycle" \
-  -H "Authorization: Bearer {api_token}" \
-  -H "Content-Type: application/json" \
-  -d '{"rules":[{"id":"expire-old-messages","enabled":true,"conditions":{"prefix":"messages/"},"actions":{"expiration":{"days":7}}}]}'
-```
-
-### Rate Limiting
-
-| Limit | Value |
-|-------|-------|
-| Requests per minute per tenant | 60 |
-| Max messages per request | 1000 |
-| Max time range | 7 days |

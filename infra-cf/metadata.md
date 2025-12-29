@@ -11,7 +11,7 @@ Durable Objects store:
 - Encrypted room metadata
 - Encrypted quorum state
 - Encrypted admin payloads
-- Recent message buffer
+- Recent message buffer (ciphertext only)
 - Routing metadata (plaintext)
 
 ---
@@ -23,17 +23,20 @@ const STORAGE_KEYS = {
   ROOM_STATE: "room:state",
   PROPOSAL_PREFIX: "proposal:",
   ONBOARDING_PREFIX: "onboarding:",
-  HISTORY_BUFFER: "history:buffer",
+  INBOX_BUFFER: "inbox:buffer",
+  INBOX_SEQ: "inbox:seq",
 };
 ```
 
 ---
 
-## MLS‑Derived Storage Keys
+## MLS‑Derived Keys
 
-Clients derive storage keys using MLS exporter:
+Clients derive various keys from MLS group state for different purposes.
 
-### Stable Key (Default)
+### Storage Key
+
+Used for encrypting room metadata:
 
 ```
 K_storage = MLS-Exporter("tunnl3d-do-metadata", "group-creation", 32)
@@ -52,6 +55,20 @@ K_storage(E) = MLS-Exporter("tunnl3d-do-metadata", "epoch-" || E, 32)
 - Derived per MLS epoch
 - Provides forward secrecy for metadata
 - Old metadata becomes unreadable after epoch rotation
+
+### Inbox Key
+
+Used for deriving the opaque inboxId:
+
+```typescript
+// All members derive the same inboxId from MLS state
+const inboxKey = await mlsGroup.export("tunnl3d-inbox-key", roomId, 32);
+const inboxId = base64url(hmacSha256(inboxKey, "inbox-id"));
+```
+
+- Deterministic: all members compute identical inboxId
+- Unlinkable: relay cannot correlate to roomId or tenantId
+- Stable: same inboxId for the lifetime of the group
 
 ---
 
@@ -145,6 +162,27 @@ interface OnboardingSlot {
 
 ---
 
+## Inbox Buffer Structure
+
+```typescript
+interface BufferedInboxEntry {
+  /** Monotonically increasing sequence number */
+  seq: number;
+  /** Client-generated stable message identifier */
+  messageId: string;
+  /** MLS-encrypted payload (base64url-encoded) */
+  ciphertext: string;
+  /** The full message envelope (for internal use) */
+  envelope: AnyEnvelope;
+  /** When the message was buffered */
+  bufferedAt: string;
+}
+```
+
+The inbox buffer is a rolling buffer of the 50 most recent messages, stored under the `INBOX_BUFFER` key.
+
+---
+
 ## Security Properties
 
 ### What Cloudflare Can See
@@ -153,6 +191,7 @@ interface OnboardingSlot {
 - Ciphertext blobs (opaque, no structure visible)
 - Timestamps
 - Routing identifiers
+- Inbox buffer (ciphertext only)
 
 ### What Cloudflare Cannot See
 
@@ -161,6 +200,8 @@ interface OnboardingSlot {
 - Quorum configuration
 - Who approved what
 - Proposal contents
+- Message plaintext
+- InboxId-to-room mapping
 - Any semantic metadata
 
 ---
@@ -180,8 +221,17 @@ interface OnboardingSlot {
 3. DO stores opaque blob
 4. DO never attempts decryption
 
+### Inbox Pattern
+
+1. Messages are buffered in DO during real-time delivery
+2. Client derives inboxId from MLS group state
+3. Client queries inbox API with inboxId
+4. Inbox Worker merges DO buffer with R2 storage
+5. Client receives ciphertext only
+
 ### Consistency
 
 - DO storage is strongly consistent within a single DO
 - All operations on a room go through the same DO instance
 - No cross-room transactions needed
+- Inbox seq is monotonically assigned by DO

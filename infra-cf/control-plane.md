@@ -1,4 +1,4 @@
-﻿# Control Plane: Workers + Queues + Durable Objects
+﻿# Control Plane: Workers + Durable Objects
 
 The control plane handles:
 
@@ -15,12 +15,14 @@ Flow:
 
 1. Client publishes MLS control envelope (proposal, commit, GroupInfo)
 2. Worker validates envelope structure (not cryptography)
-3. Worker enqueues into `MLS_QUEUE`
-4. Room DO processes ordered control messages:
+3. Worker synchronously delivers to Room DO via `/deliver`
+4. Room DO processes control messages:
    - Stores proposals with encrypted content
    - Updates encrypted metadata
    - Stores encrypted quorum state
    - Routes commit notifications
+   - Broadcasts to connected WebSocket clients
+5. Room DO enqueues to `INBOX_QUEUE` for R2 persistence (async, fire-and-forget)
 
 The DO never sees plaintext or MLS secrets.
 
@@ -84,8 +86,9 @@ Each room has a dedicated Durable Object that provides:
 - **WebSocket session management** — hibernatable connections with session state
 - **Message fan-out** — broadcasts to all connected clients in a room
 - **Encrypted state storage** — room metadata, proposals, onboarding slots
-- **Recent message buffer** — rolling buffer of last 50 messages for instant history
+- **Recent message buffer** — rolling buffer of last 500 messages for instant inbox access
 - **Proposal lifecycle** — stores and routes proposal state changes
+- **Rate limiting** — per-room sliding window rate limiter
 
 ### DO Storage Keys
 
@@ -94,7 +97,9 @@ const STORAGE_KEYS = {
   ROOM_STATE: "room:state",
   PROPOSAL_PREFIX: "proposal:",
   ONBOARDING_PREFIX: "onboarding:",
-  HISTORY_BUFFER: "history:buffer",
+  INBOX_BUFFER: "inbox:buffer",
+  INBOX_SEQ: "inbox:seq",
+  RATE_LIMIT_TIMESTAMPS: "rate:timestamps",
 };
 ```
 
