@@ -52,6 +52,7 @@ Properties:
 - **Synchronous WebSocket broadcast** — connected clients receive message immediately
 - **Per-room rate limiting** — prevents buffer overflow under heavy load
 - **No plaintext** — server sees only ciphertext
+- **No per-message timestamps** — async queue batching obfuscates message timing
 - **No handle or identity leakage** — only pseudonym IDs in routing
 - **No inter-DO communication** — each room has exactly one DO instance
 
@@ -106,7 +107,7 @@ Content-Type: application/json
 
 The rate limiter uses a sliding window algorithm:
 
-1. Each message delivery records a timestamp
+1. Each message delivery records a timestamp (in-memory only, not persisted with message)
 2. Timestamps older than the window (5s) are pruned
 3. If count >= limit (500), request is rejected
 4. Response includes precise `retryAfterMs` for efficient client backoff
@@ -171,6 +172,8 @@ tunnl3d uses Cloudflare Queues for async R2 persistence:
 | `MLS_DLQ` | Dead letter queue for failed messages | — | — | — |
 
 All message delivery happens **synchronously** via the Room DO. The queue is only used for durable R2 persistence after messages are already delivered to clients.
+
+**Privacy benefit:** The async queue processing naturally obfuscates per-message timing. Messages are batched together before R2 writes, making traffic analysis more difficult.
 
 ---
 
@@ -250,7 +253,6 @@ interface BufferedInboxEntry {
   messageId: string;      // Message ID
   ciphertext: string;     // MLS-encrypted payload
   envelope: AnyEnvelope;  // Full envelope for internal use
-  bufferedAt: string;     // When buffered in DO
 }
 ```
 
@@ -296,7 +298,7 @@ inbox/room-456/0000000042-msg-abc123.json
 | Write timing | Async (via INBOX_QUEUE, ~5s delay) |
 | Durability | High (R2 replication) |
 | Default retention | 7 days |
-| Auto-expiration | Lifecycle policy |
+| Auto-expiration | Lifecycle policy (based on R2 object age) |
 
 ---
 
@@ -331,8 +333,7 @@ The Inbox Worker serves the inbox endpoints for message retrieval. The `inboxId`
     {
       "seq": 42,
       "messageId": "msg-abc123",
-      "ciphertext": "base64url-encoded-content",
-      "createdAt": "2024-12-23T10:05:00.000Z"
+      "ciphertext": "base64url-encoded-content"
     }
   ],
   "nextSeq": 43
@@ -364,8 +365,7 @@ Used for direct inbox writes (bypassing the Room DO flow).
 
 ```json
 {
-  "seq": 42,
-  "storedAt": "2024-12-23T10:05:00.000Z"
+  "seq": 42
 }
 ```
 
@@ -438,6 +438,8 @@ const inboxId = base64(hmacSha256(inboxKey, "inbox-id"));
 | **Authorization** | Knowledge of inboxId grants access |
 | **Opacity** | Relay cannot correlate inboxId to room or tenant |
 | **Zero-trust** | Relay stores only ciphertext |
+| **No timestamps** | No per-message cleartext timestamps stored |
+| **Timing obfuscation** | Async queue batching obscures message timing |
 
 ---
 
@@ -447,6 +449,7 @@ const inboxId = base64(hmacSha256(inboxKey, "inbox-id"));
 
 - Messages older than 7 days are automatically deleted
 - Configurable via lifecycle rules
+- Based on R2 object creation time, not message metadata
 
 ### R2 Lifecycle Configuration
 

@@ -174,12 +174,12 @@ interface BufferedInboxEntry {
   ciphertext: string;
   /** The full message envelope (for internal use) */
   envelope: AnyEnvelope;
-  /** When the message was buffered */
-  bufferedAt: string;
 }
 ```
 
-The inbox buffer is a rolling buffer of the 50 most recent messages, stored under the `INBOX_BUFFER` key.
+The inbox buffer is a rolling buffer of the 500 most recent messages, stored under the `INBOX_BUFFER` key.
+
+**Note:** No server-side timestamp is stored with buffered messages. This avoids exposing per-message timing metadata. Any display timestamps should be included inside the MLS-encrypted envelope by clients.
 
 ---
 
@@ -189,9 +189,9 @@ The inbox buffer is a rolling buffer of the 50 most recent messages, stored unde
 
 - Storage key names (e.g., `room:state`, `proposal:abc123`)
 - Ciphertext blobs (opaque, no structure visible)
-- Timestamps
+- Room/proposal lifecycle timestamps (createdAt, expiresAt for operational purposes)
 - Routing identifiers
-- Inbox buffer (ciphertext only)
+- Inbox buffer (ciphertext only, no per-message timestamps)
 
 ### What Cloudflare Cannot See
 
@@ -202,6 +202,7 @@ The inbox buffer is a rolling buffer of the 50 most recent messages, stored unde
 - Proposal contents
 - Message plaintext
 - InboxId-to-room mapping
+- Per-message timing (obfuscated by async queue batching)
 - Any semantic metadata
 
 ---

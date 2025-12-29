@@ -62,7 +62,8 @@ Each entry in an inbox represents one MLS-encrypted message:
 | `seq` | integer | Monotonically increasing sequence number per inbox |
 | `messageId` | string | Client-generated stable identifier for deduplication |
 | `ciphertext` | string | MLS-encrypted payload (base64url-encoded) |
-| `createdAt` | string | Server-side timestamp (RFC3339) |
+
+**Note:** No server-side timestamp is stored. The async queue processing provides natural timing obfuscation. Any display timestamps should be included inside the MLS-encrypted envelope by clients.
 
 ---
 
@@ -133,8 +134,7 @@ X-Inbox-ID: dGVuYW50LTEyMzpyb29tLTQ1Ng==
     {
       "seq": 42,
       "messageId": "msg-abc123",
-      "ciphertext": "base64url-encoded-blob",
-      "createdAt": "2024-12-23T12:00:00.000Z"
+      "ciphertext": "base64url-encoded-blob"
     }
   ],
   "nextSeq": 43
@@ -205,8 +205,7 @@ Status: 202 Accepted
 
 ```json
 {
-  "seq": 42,
-  "storedAt": "2024-12-23T12:00:00.000Z"
+  "seq": 42
 }
 ```
 
@@ -221,7 +220,7 @@ Status: 202 Accepted
 Messages are retained based on time-to-live (TTL):
 
 - **Default retention:** 7 days
-- **Automatic expiration:** R2 lifecycle policy deletes expired entries
+- **Automatic expiration:** R2 lifecycle policy deletes expired entries (based on R2 object age, not message metadata)
 - **No acknowledgment required:** Clients are responsible for fetching before TTL expiration
 
 ### Client Considerations
@@ -241,7 +240,7 @@ The relay sees only:
 - `inboxId` (opaque, unlinkable to room or tenant, **not logged in URL**)
 - `messageId` (opaque)
 - `ciphertext` (encrypted, opaque)
-- `seq` and `createdAt` (operational metadata)
+- `seq` (operational metadata for ordering)
 
 The relay cannot determine:
 
@@ -250,6 +249,7 @@ The relay cannot determine:
 - Group membership or size
 - Message content or type
 - Sender or recipient identities
+- Per-message timing (R2 write time is obfuscated by async queue batching)
 
 ### Access Control
 
@@ -306,7 +306,8 @@ The Inbox API provides:
 - **Header-based inboxId** — capability token kept out of URL logs
 - **Seq-based ordered retrieval** with pagination
 - **TTL-based retention** (no ack complexity)
-- **Minimal metadata exposure** to the relay
+- **Minimal metadata exposure** to the relay (no per-message timestamps)
+- **Timing obfuscation** — async queue batching obscures individual message timing
 - **Seamless integration** with real-time WebSocket delivery
 
 All group semantics, membership knowledge, and encryption remain client-side. The relay is a blind, stateless storage substrate.
