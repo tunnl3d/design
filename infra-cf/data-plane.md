@@ -4,6 +4,34 @@ The data plane handles all ciphertext transport with a focus on low-latency deli
 
 ---
 
+## WebSocket Connection
+
+Clients connect to the WebSocket endpoint using header-based routing to keep routing metadata out of URL logs.
+
+**Endpoint:** `GET /room`
+
+**Headers:**
+
+| Header | Type | Required | Description |
+|--------|------|----------|-------------|
+| `X-Room-ID` | string | Yes | Room identifier (globally unique) |
+| `X-Pseudonym-ID` | string | Yes | Client pseudonym identifier |
+
+**Example:**
+
+```http
+GET /room HTTP/1.1
+Host: tunnl3d.app
+Upgrade: websocket
+Connection: Upgrade
+X-Room-ID: room-456
+X-Pseudonym-ID: user-abc
+```
+
+**Security Note:** Routing metadata is passed via headers rather than the URL path. This keeps sensitive identifiers out of standard HTTP access logs, CDN logs, and proxy logs—matching the pattern used by the Inbox API.
+
+---
+
 ## Application Messages
 
 Message flow ensures **immediate inbox availability**:
@@ -258,7 +286,7 @@ inbox/{inboxId}/{seq:010d}-{messageId}.json
 
 Example:
 ```
-inbox/tenant-123:room-456/0000000042-msg-abc123.json
+inbox/room-456/0000000042-msg-abc123.json
 ```
 
 #### Storage Properties
@@ -372,7 +400,7 @@ sequenceDiagram
 
     Note over C: Process messages<br/>(MLS decrypt)
 
-    C->>DO: GET /ws/:tenant/:room
+    C->>DO: GET /room<br/>X-Room-ID
     DO->>C: 101 Switching Protocols
 
     Note over C,DO: Resume real-time<br/>WebSocket messages
@@ -418,7 +446,7 @@ const inboxId = base64(hmacSha256(inboxKey, "inbox-id"));
 ### Default Retention Policy
 
 - Messages older than 7 days are automatically deleted
-- Configurable per tenant via lifecycle rules
+- Configurable via lifecycle rules
 
 ### R2 Lifecycle Configuration
 
